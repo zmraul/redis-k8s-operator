@@ -20,31 +20,49 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 from charms.redis_k8s.v0.redis import RedisProvides
-from ops.charm import CharmBase
 from ops.main import main
+from ops.charm import CharmBase
 from ops.model import ActiveStatus, WaitingStatus
-from ops.pebble import ConnectionError
+from ops.pebble import Layer
 
 REDIS_PORT = 6379
 WAITING_MESSAGE = 'Waiting for Redis...'
+PEERS = "redis-k8s"
 
 logger = logging.getLogger(__name__)
 
 
-class RedisK8sCharm(CharmBase):
+class RedisCharm(CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
 
+        self._container = self.unit.get_container("redis")
         self.redis_provides = RedisProvides(self, port=REDIS_PORT)
 
-        self.framework.observe(self.on.config_changed, self.config_changed)
-        self.framework.observe(self.on.upgrade_charm, self.config_changed)
-        self.framework.observe(self.on.update_status, self.update_status)
+        self.framework.observe(self.on.redis_pebble_ready, self._redis_pebble_ready)
+        self.framework.observe(self.on.config_changed, self._config_changed)
+        self.framework.observe(self.on.upgrade_charm, self._config_changed)
+        self.framework.observe(self.on.update_status, self._update_status)
 
         self.framework.observe(self.on.check_service_action, self.check_service)
+    
 
-    def config_changed(self, event):
+    def _redis_pebble_ready(self, event) -> None:
+        """"""
+        self._update_layer()
+        
+    
+    def _config_changed(self, event):
         logger.info("Beginning config_changed")
+        self._update_layer()
+        self._redis_check()
+
+    def _update_status(self, event):
+        logger.info("Beginning update_status")
+        self._redis_check()
+    
+    def _redis_layer(self) -> Layer:
+        """Return a the configuration Pebble layer for Redis."""
         layer_config = {
             "summary": "Redis layer",
             "description": "Redis layer",
@@ -60,32 +78,29 @@ class RedisK8sCharm(CharmBase):
                 }
             }
         }
+        return Layer(layer_config)
 
-        try:
-            container = self.unit.get_container("redis")
-            services = container.get_plan().to_dict().get("services", {})
-
-            if services != layer_config["services"]:
-                logger.debug("About to add_layer with layer_config:\n{}".format(layer_config))
-                container.add_layer("redis", layer_config, combine=True)
-
-                service = container.get_service("redis")
-                if service.is_running():
-                    logger.debug("Stopping service")
-                    container.stop("redis")
-                logger.debug("Starting service")
-                container.start("redis")
-        except ConnectionError:
-            logger.info("Pebble is not ready, deferring event")
-            event.defer()
+    def _update_layer(self) -> None:
+        """Update the Pebble layer and restart the container"""
+        if not self._container.can_connect():
+            self.unit.status = WaitingStatus("Waiting for Pebble in workload container")
             return
 
-        self._redis_check()
+        # Get current config
+        current_layer = self._container.get_plan()
+        # Create the config layer
+        new_layer = self._redis_layer()
 
-    def update_status(self, event):
-        logger.info("Beginning update_status")
-        self._redis_check()
+        # Update the Pebble configuration layer
+        if current_layer.services != new_layer.services:
+            self._container.add_layer("redis", new_layer, combine=True)
+            logger.info("Added updated layer 'redis' to Pebble plan")
+            self._container.restart("redis")
+            logger.info("Restarted redis service")
 
+        self.unit.status = ActiveStatus()
+    
+    
     def check_service(self, event):
         logger.info("Beginning check_service")
         results = {}
@@ -113,4 +128,4 @@ class RedisK8sCharm(CharmBase):
 
 
 if __name__ == "__main__":  # pragma: nocover
-    main(RedisK8sCharm)
+    main(RedisCharm)
